@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>袋分け帳</title>
+<meta name="description" content="クレカ利用の記録・現金の袋分け・おつり返却の忘れ防止に">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#25313A">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="袋分け帳">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" href="icon-192.png">
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // window.storage は Claude アーティファクト専用APIなので、
+  // 同じインターフェースを localStorage で肩代わりする。
+  window.storage = {
+    get: async (key) => ({ value: localStorage.getItem(key) }),
+    set: async (key, value) => { localStorage.setItem(key, value); },
+  };
+</script>
+
+<script type="text/jsx-source" id="app-source">
+const { useState, useEffect } = React;
+
+// ---------- 定数 ----------
+const STORAGE_KEY = "fukuro-wake-data";
+const EMPTY = { envelopes: [], pending: [], transactions: [], purchases: [] };
+
+const C = {
+  paper: "#F6F4EE",
+  ink: "#25313A",
+  inkSoft: "#5C6870",
+  kraft: "#E3D5B8",
+  kraftDeep: "#D3C09B",
+  kraftLine: "#C4AE84",
+  shu: "#C43D2E",
+  shuBg: "#FBEDEA",
+  green: "#2F6B4F",
+  greenBg: "#EAF2ED",
+  blue: "#2D5A78",
+  blueBg: "#E9F0F5",
+  line: "#DDD8CB",
+  white: "#FFFFFF",
+};
+
+const yen = (n) => "¥" + Number(n || 0).toLocaleString("ja-JP");
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const fmtDate = (iso) => {
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+const fmtDay = (iso) => {
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+};
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+function FukuroWake() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("fukuro"); // fukuro | card | pending | history
+  const [modal, setModal] = useState(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  // ---------- 読み込み ----------
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(STORAGE_KEY);
+        if (r && r.value) {
+          const parsed = JSON.parse(r.value);
+          if (!parsed.purchases) parsed.purchases = []; // 旧データの移行
+          setData(parsed);
+          return;
+        }
+      } catch (e) {
+        // キーが無いだけなら初期データで開始
+      }
+      setData(EMPTY);
+    })();
+  }, []);
+
+  // ---------- 保存つき更新 ----------
+  const update = async (fn) => {
+    const next = fn(JSON.parse(JSON.stringify(data)));
+    setData(next);
+    try {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.error("保存に失敗しました", e);
+    }
+  };
+
+  // ---------- 操作 ----------
+  const addEnvelope = (name) =>
+    update((d) => {
+      d.envelopes.push({ id: uid(), name, balance: 0 });
+      return d;
+    });
+
+  const deleteEnvelope = (envId) =>
+    update((d) => {
+      d.envelopes = d.envelopes.filter((e) => e.id !== envId);
+      d.pending = d.pending.filter((p) => p.envId !== envId || p.done);
+      d.purchases = d.purchases.filter((p) => p.envId !== envId || p.settled);
+      return d;
+    });
+
+  const addPurchase = (envId, amount, memo, dateStr) =>
+    update((d) => {
+      const env = d.envelopes.find((e) => e.id === envId);
+      const date = dateStr ? new Date(dateStr + "T12:00:00").toISOString() : new Date().toISOString();
+      d.purchases.unshift({
+        id: uid(), envId, envName: env ? env.name : "", amount, memo, date, settled: false,
+      });
+      return d;
+    });
+
+  const removePurchase = (pid) =>
+    update((d) => {
+      d.purchases = d.purchases.filter((p) => p.id !== pid);
+      return d;
+    });
+
+  const deposit = (envId, alloc, actual, purchaseIds, memo) =>
+    update((d) => {
+      const env = d.envelopes.find((e) => e.id === envId);
+      if (!env) return d;
+      env.balance += actual;
+      const now = new Date().toISOString();
+      let settledCount = 0;
+      (purchaseIds || []).forEach((pid) => {
+        const p = d.purchases.find((x) => x.id === pid && !x.settled);
+        if (p) {
+          p.settled = true;
+          p.settledDate = now;
+          settledCount++;
+        }
+      });
+      d.transactions.unshift({
+        id: uid(), envId, envName: env.name, type: "deposit",
+        amount: actual, alloc, settledCount, memo: memo || "", date: now,
+      });
+      const diff = actual - alloc;
+      if (diff > 0) {
+        d.pending.unshift({
+          id: uid(), envId, envName: env.name, amount: diff, date: now, done: false,
+        });
+      }
+      return d;
+    });
+
+  const withdraw = (envId, amount, memo) =>
+    update((d) => {
+      const env = d.envelopes.find((e) => e.id === envId);
+      if (!env) return d;
+      env.balance -= amount;
+      d.transactions.unshift({
+        id: uid(), envId, envName: env.name, type: "withdraw",
+        amount, memo, date: new Date().toISOString(),
+      });
+      return d;
+    });
+
+  const returnChange = (pendingId) =>
+    update((d) => {
+      const p = d.pending.find((x) => x.id === pendingId);
+      if (!p || p.done) return d;
+      p.done = true;
+      p.doneDate = new Date().toISOString();
+      const env = d.envelopes.find((e) => e.id === p.envId);
+      if (env) env.balance -= p.amount;
+      d.transactions.unshift({
+        id: uid(), envId: p.envId, envName: p.envName, type: "return",
+        amount: p.amount, date: new Date().toISOString(),
+      });
+      return d;
+    });
+
+  const resetAll = async () => {
+    setData(EMPTY);
+    setConfirmReset(false);
+    try {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(EMPTY));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  if (!data) {
+    return (
+      <div style={{ minHeight: "100vh", background: C.paper, display: "flex",
+        alignItems: "center", justifyContent: "center", color: C.inkSoft,
+        fontFamily: "'Zen Kaku Gothic New', 'Hiragino Sans', sans-serif" }}>
+        読み込み中…
+      </div>
+    );
+  }
+
+  const openPending = data.pending.filter((p) => !p.done);
+  const pendingTotal = openPending.reduce((s, p) => s + p.amount, 0);
+  const openPurchases = data.purchases.filter((p) => !p.settled);
+  const purchaseTotal = openPurchases.reduce((s, p) => s + p.amount, 0);
+
+  return (
+    <div className="fw-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+        .fw-root {
+          min-height: 100vh; background: ${C.paper}; color: ${C.ink};
+          font-family: 'Zen Kaku Gothic New', 'Hiragino Sans', 'Yu Gothic', sans-serif;
+          -webkit-font-smoothing: antialiased;
+        }
+        .fw-wrap { max-width: 440px; margin: 0 auto; padding: 20px 16px 48px; }
+        .fw-title {
+          font-family: 'Shippori Mincho', 'Hiragino Mincho ProN', serif;
+          font-size: 22px; font-weight: 700; letter-spacing: 0.14em; margin: 0;
+        }
+        .fw-sub { font-size: 11px; color: ${C.inkSoft}; letter-spacing: 0.08em; margin-top: 2px; }
+        .mono { font-family: 'IBM Plex Mono', 'Menlo', monospace; font-variant-numeric: tabular-nums; }
+
+        .fw-alert {
+          margin-top: 14px; border-radius: 10px; padding: 12px 14px; display: flex;
+          align-items: center; gap: 12px; cursor: pointer; width: 100%; text-align: left;
+        }
+        .fw-alert.shu { border: 1.5px solid ${C.shu}; background: ${C.shuBg}; }
+        .fw-alert.blue { border: 1.5px solid ${C.blue}; background: ${C.blueBg}; }
+        .fw-stamp {
+          width: 44px; height: 44px; border-radius: 50%;
+          display: flex; align-items: center; justify-content: center;
+          font-family: 'Shippori Mincho', serif; font-weight: 700; font-size: 11px;
+          line-height: 1.15; text-align: center; flex-shrink: 0; transform: rotate(-6deg);
+        }
+        .fw-stamp.shu { border: 2px solid ${C.shu}; color: ${C.shu}; }
+        .fw-stamp.blue { border: 2px solid ${C.blue}; color: ${C.blue}; }
+
+        .fw-tabs { display: flex; gap: 2px; margin-top: 18px; border-bottom: 1.5px solid ${C.line}; }
+        .fw-tab {
+          background: none; border: none; padding: 8px 8px 10px; font-size: 13.5px;
+          color: ${C.inkSoft}; cursor: pointer; font-family: inherit; font-weight: 500;
+          border-bottom: 2.5px solid transparent; margin-bottom: -1.5px; white-space: nowrap;
+        }
+        .fw-tab.on { color: ${C.ink}; font-weight: 700; border-bottom-color: ${C.ink}; }
+        .fw-badge {
+          display: inline-block; min-width: 17px; padding: 0 4px; margin-left: 3px;
+          color: #fff; border-radius: 9px; font-size: 10.5px; line-height: 17px; font-weight: 700;
+        }
+        .fw-badge.shu { background: ${C.shu}; }
+        .fw-badge.blue { background: ${C.blue}; }
+
+        .env-card {
+          position: relative; margin-top: 16px; background: ${C.kraft};
+          border: 1px solid ${C.kraftLine}; border-radius: 8px; overflow: hidden;
+          box-shadow: 0 1px 3px rgba(60,50,30,0.12);
+        }
+        .env-flap {
+          height: 26px; background: ${C.kraftDeep};
+          clip-path: polygon(0 0, 100% 0, 50% 100%); opacity: 0.55;
+        }
+        .env-body { padding: 6px 16px 14px; }
+        .env-name {
+          font-family: 'Shippori Mincho', serif; font-size: 17px; font-weight: 700;
+          letter-spacing: 0.06em;
+        }
+        .env-amount { font-size: 26px; font-weight: 600; margin-top: 4px; }
+        .env-row { display: flex; align-items: baseline; justify-content: space-between; }
+        .env-note-shu { font-size: 12px; color: ${C.shu}; font-weight: 700; margin-top: 4px; }
+        .env-note-blue { font-size: 12px; color: ${C.blue}; font-weight: 700; margin-top: 4px; }
+        .env-real { font-size: 12px; color: ${C.inkSoft}; margin-top: 2px; }
+        .env-actions { display: flex; gap: 8px; margin-top: 12px; }
+        .btn {
+          font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
+          border-radius: 7px; padding: 8px 14px; border: 1.5px solid ${C.ink};
+          background: ${C.white}; color: ${C.ink};
+        }
+        .btn.primary { background: ${C.ink}; color: ${C.white}; }
+        .btn.shu { border-color: ${C.shu}; color: ${C.shu}; background: ${C.white}; }
+        .btn.ghost { border-color: transparent; background: transparent; color: ${C.inkSoft}; padding: 8px 6px; }
+        .btn:disabled { opacity: 0.4; cursor: default; }
+
+        .list-item {
+          background: ${C.white}; border: 1px solid ${C.line}; border-radius: 10px;
+          padding: 12px 14px; margin-top: 10px;
+        }
+        .li-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+        .li-name { font-weight: 700; font-size: 14px; }
+        .li-date { font-size: 11px; color: ${C.inkSoft}; }
+        .li-memo { font-size: 12px; color: ${C.inkSoft}; margin-top: 2px; }
+        .amt-in { color: ${C.green}; }
+        .amt-out { color: ${C.ink}; }
+        .amt-ret { color: ${C.shu}; }
+        .amt-card { color: ${C.blue}; }
+
+        .section-label { margin-top: 24px; font-size: 12px; font-weight: 700; color: ${C.inkSoft}; }
+        .empty {
+          margin-top: 28px; text-align: center; color: ${C.inkSoft}; font-size: 13px;
+          line-height: 1.9;
+        }
+
+        .overlay {
+          position: fixed; inset: 0; background: rgba(30,30,25,0.45);
+          display: flex; align-items: flex-end; justify-content: center; z-index: 50;
+        }
+        .sheet {
+          background: ${C.paper}; width: 100%; max-width: 440px;
+          border-radius: 16px 16px 0 0; padding: 20px 18px 28px;
+          max-height: 88vh; overflow-y: auto;
+        }
+        .sheet h2 {
+          font-family: 'Shippori Mincho', serif; font-size: 17px; font-weight: 700;
+          margin: 0 0 4px; letter-spacing: 0.08em;
+        }
+        .sheet .env-of { font-size: 12px; color: ${C.inkSoft}; margin-bottom: 10px; }
+        .field { margin-top: 14px; }
+        .field label { display: block; font-size: 12px; font-weight: 700; color: ${C.inkSoft}; margin-bottom: 6px; }
+        .field input, .field select {
+          width: 100%; box-sizing: border-box; font-size: 20px; padding: 10px 12px;
+          border: 1.5px solid ${C.line}; border-radius: 8px; background: ${C.white};
+          color: ${C.ink}; font-family: 'IBM Plex Mono', monospace;
+        }
+        .field input[type=text], .field input[type=date], .field select { font-family: inherit; font-size: 16px; }
+        .field input:focus, .field select:focus { outline: 2px solid ${C.ink}; outline-offset: 1px; }
+        .quick { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .chip {
+          font-family: inherit; font-size: 12px; font-weight: 700; padding: 6px 10px;
+          border-radius: 999px; border: 1.5px solid ${C.line}; background: ${C.white};
+          color: ${C.ink}; cursor: pointer;
+        }
+        .chip.on { border-color: ${C.ink}; background: ${C.ink}; color: ${C.white}; }
+        .pick {
+          display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+          background: ${C.white}; border: 1.5px solid ${C.line}; border-radius: 8px;
+          padding: 10px 12px; margin-top: 8px; cursor: pointer; font-family: inherit;
+        }
+        .pick.on { border-color: ${C.blue}; background: ${C.blueBg}; }
+        .pick .box {
+          width: 18px; height: 18px; border: 2px solid ${C.line}; border-radius: 4px;
+          flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+          font-size: 12px; color: #fff;
+        }
+        .pick.on .box { background: ${C.blue}; border-color: ${C.blue}; }
+        .note-shu {
+          margin-top: 14px; border: 1.5px dashed ${C.shu}; background: ${C.shuBg};
+          color: ${C.shu}; border-radius: 8px; padding: 10px 12px; font-size: 13px;
+          font-weight: 700; line-height: 1.6;
+        }
+        .note-ok {
+          margin-top: 14px; border: 1.5px dashed ${C.green}; background: ${C.greenBg};
+          color: ${C.green}; border-radius: 8px; padding: 10px 12px; font-size: 13px;
+          font-weight: 700;
+        }
+        .sheet-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .sheet-actions .btn { flex: 1; padding: 12px; font-size: 15px; }
+
+        .footer { margin-top: 40px; text-align: center; }
+        .footer button {
+          background: none; border: none; color: ${C.inkSoft}; font-size: 11px;
+          text-decoration: underline; cursor: pointer; font-family: inherit;
+        }
+        @media (prefers-reduced-motion: no-preference) {
+          .sheet { animation: up 0.18s ease-out; }
+          @keyframes up { from { transform: translateY(24px); opacity: 0.6; } to { transform: none; opacity: 1; } }
+        }
+      `}</style>
+
+      <div className="fw-wrap">
+        <header>
+          <h1 className="fw-title">袋分け帳</h1>
+          <div className="fw-sub">クレカ利用の記録・現金の袋分け・おつり返却の忘れ防止に</div>
+        </header>
+
+        {pendingTotal > 0 && (
+          <button className="fw-alert shu" onClick={() => setTab("pending")}>
+            <div className="fw-stamp shu">要<br />返却</div>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.shu }}>返却待ちのおつりがあります</div>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 600, color: C.shu }}>
+                {yen(pendingTotal)}
+                <span style={{ fontSize: 12, marginLeft: 6 }}>({openPending.length}件)</span>
+              </div>
+            </div>
+          </button>
+        )}
+
+        {purchaseTotal > 0 && (
+          <button className="fw-alert blue" onClick={() => setTab("card")}>
+            <div className="fw-stamp blue">振分<br />待ち</div>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.blue }}>クレカ分でまだ袋に入れていないお金</div>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 600, color: C.blue }}>
+                {yen(purchaseTotal)}
+                <span style={{ fontSize: 12, marginLeft: 6 }}>({openPurchases.length}件)</span>
+              </div>
+            </div>
+          </button>
+        )}
+
+        <nav className="fw-tabs">
+          <button className={`fw-tab ${tab === "fukuro" ? "on" : ""}`} onClick={() => setTab("fukuro")}>袋</button>
+          <button className={`fw-tab ${tab === "card" ? "on" : ""}`} onClick={() => setTab("card")}>
+            クレカ{openPurchases.length > 0 && <span className="fw-badge blue">{openPurchases.length}</span>}
+          </button>
+          <button className={`fw-tab ${tab === "pending" ? "on" : ""}`} onClick={() => setTab("pending")}>
+            返却待ち{openPending.length > 0 && <span className="fw-badge shu">{openPending.length}</span>}
+          </button>
+          <button className={`fw-tab ${tab === "history" ? "on" : ""}`} onClick={() => setTab("history")}>履歴</button>
+        </nav>
+
+        {tab === "fukuro" && (
+          <EnvelopeTab
+            data={data}
+            onDeposit={(envId) => setModal({ type: "deposit", envId })}
+            onWithdraw={(envId) => setModal({ type: "withdraw", envId })}
+            onAdd={() => setModal({ type: "addEnv" })}
+            onDelete={(envId) => setModal({ type: "deleteEnv", envId })}
+          />
+        )}
+
+        {tab === "card" && (
+          <CardTab
+            data={data}
+            onAdd={() => setModal({ type: "addPurchase" })}
+            onRemove={removePurchase}
+            onGoDeposit={(envId) => setModal({ type: "deposit", envId })}
+          />
+        )}
+
+        {tab === "pending" && <PendingTab data={data} onReturn={returnChange} />}
+        {tab === "history" && <HistoryTab data={data} />}
+
+        <div className="footer">
+          {!confirmReset ? (
+            <button onClick={() => setConfirmReset(true)}>データをリセット</button>
+          ) : (
+            <span style={{ fontSize: 12, color: C.shu }}>
+              全データを消します。よろしいですか?{" "}
+              <button style={{ color: C.shu, fontWeight: 700 }} onClick={resetAll}>消す</button>{" "}
+              <button onClick={() => setConfirmReset(false)}>やめる</button>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {modal?.type === "addEnv" && (
+        <AddEnvSheet
+          onClose={() => setModal(null)}
+          onSave={(name) => { addEnvelope(name); setModal(null); }}
+        />
+      )}
+      {modal?.type === "addPurchase" && (
+        <PurchaseSheet
+          envelopes={data.envelopes}
+          onClose={() => setModal(null)}
+          onSave={(envId, amount, memo, dateStr) => { addPurchase(envId, amount, memo, dateStr); setModal(null); }}
+        />
+      )}
+      {modal?.type === "deposit" && (
+        <DepositSheet
+          env={data.envelopes.find((e) => e.id === modal.envId)}
+          purchases={data.purchases.filter((p) => p.envId === modal.envId && !p.settled)}
+          onClose={() => setModal(null)}
+          onSave={(alloc, actual, ids, memo) => { deposit(modal.envId, alloc, actual, ids, memo); setModal(null); }}
+        />
+      )}
+      {modal?.type === "withdraw" && (
+        <WithdrawSheet
+          env={data.envelopes.find((e) => e.id === modal.envId)}
+          onClose={() => setModal(null)}
+          onSave={(amount, memo) => { withdraw(modal.envId, amount, memo); setModal(null); }}
+        />
+      )}
+      {modal?.type === "deleteEnv" && (
+        <DeleteSheet
+          env={data.envelopes.find((e) => e.id === modal.envId)}
+          onClose={() => setModal(null)}
+          onDelete={() => { deleteEnvelope(modal.envId); setModal(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------- 袋タブ ----------
+function EnvelopeTab({ data, onDeposit, onWithdraw, onAdd, onDelete }) {
+  const pendingFor = (envId) =>
+    data.pending.filter((p) => p.envId === envId && !p.done).reduce((s, p) => s + p.amount, 0);
+  const purchaseFor = (envId) =>
+    data.purchases.filter((p) => p.envId === envId && !p.settled).reduce((s, p) => s + p.amount, 0);
+
+  return (
+    <div>
+      {data.envelopes.length === 0 && (
+        <div className="empty">
+          袋がまだありません。<br />
+          「食費」「日用品」など、銀行や用途ごとの袋を追加して始めましょう。
+        </div>
+      )}
+
+      {data.envelopes.map((env) => {
+        const pend = pendingFor(env.id);
+        const pur = purchaseFor(env.id);
+        return (
+          <div className="env-card" key={env.id}>
+            <div className="env-flap" />
+            <div className="env-body">
+              <div className="env-row">
+                <div className="env-name">{env.name}</div>
+                <button className="btn ghost" onClick={() => onDelete(env.id)} aria-label={`${env.name}を削除`}>削除</button>
+              </div>
+              <div className="env-amount mono">{yen(env.balance)}</div>
+              {pur > 0 && (
+                <div className="env-note-blue">クレカ分 振り分け待ち {yen(pur)}</div>
+              )}
+              {pend > 0 && (
+                <>
+                  <div className="env-note-shu">うち返却待ち {yen(pend)}</div>
+                  <div className="env-real">返却後の残高 {yen(env.balance - pend)}</div>
+                </>
+              )}
+              <div className="env-actions">
+                <button className="btn primary" onClick={() => onDeposit(env.id)}>入金</button>
+                <button className="btn" onClick={() => onWithdraw(env.id)}>出金</button>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{ marginTop: 18 }}>
+        <button className="btn" style={{ width: "100%", padding: 12 }} onClick={onAdd}>
+          + 袋を追加
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- クレカタブ ----------
+function CardTab({ data, onAdd, onRemove, onGoDeposit }) {
+  const [confirmId, setConfirmId] = useState(null);
+  const open = data.purchases.filter((p) => !p.settled);
+  const done = data.purchases.filter((p) => p.settled).slice(0, 20);
+  const total = open.reduce((s, p) => s + p.amount, 0);
+
+  // 袋ごとにまとめる
+  const byEnv = {};
+  open.forEach((p) => {
+    if (!byEnv[p.envId]) byEnv[p.envId] = { name: p.envName, items: [], total: 0 };
+    byEnv[p.envId].items.push(p);
+    byEnv[p.envId].total += p.amount;
+  });
+
+  return (
+    <div>
+      <div style={{ marginTop: 16 }}>
+        <button className="btn primary" style={{ width: "100%", padding: 12 }} onClick={onAdd}>
+          + クレカ利用を記録
+        </button>
+      </div>
+
+      {open.length === 0 && (
+        <div className="empty">
+          振り分け待ちのクレカ利用はありません。<br />
+          カードを切ったら、その場で記録しておくと忘れません。
+        </div>
+      )}
+
+      {open.length > 0 && (
+        <div style={{ marginTop: 14, fontSize: 13, fontWeight: 700, color: C.blue }}>
+          振り分け待ち合計 <span className="mono" style={{ fontSize: 16 }}>{yen(total)}</span>
+        </div>
+      )}
+
+      {Object.entries(byEnv).map(([envId, g]) => (
+        <div key={envId}>
+          <div className="section-label" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>{g.name} へ {yen(g.total)}</span>
+            <button className="btn" style={{ fontSize: 12, padding: "5px 10px" }} onClick={() => onGoDeposit(envId)}>
+              この袋に入金する
+            </button>
+          </div>
+          {g.items.map((p) => (
+            <div className="list-item" key={p.id}>
+              <div className="li-top">
+                <div>
+                  <div className="li-name">{p.memo || "(メモなし)"}</div>
+                  <div className="li-date">{fmtDay(p.date)} にカード利用</div>
+                </div>
+                <div className="mono amt-card" style={{ fontSize: 17, fontWeight: 600 }}>{yen(p.amount)}</div>
+              </div>
+              <div style={{ marginTop: 8, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                {confirmId === p.id ? (
+                  <>
+                    <button className="btn shu" onClick={() => { onRemove(p.id); setConfirmId(null); }}>この記録を消す</button>
+                    <button className="btn ghost" onClick={() => setConfirmId(null)}>戻る</button>
+                  </>
+                ) : (
+                  <button className="btn ghost" onClick={() => setConfirmId(p.id)}>削除</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      {done.length > 0 && (
+        <>
+          <div className="section-label">振り分け済み(直近)</div>
+          {done.map((p) => (
+            <div className="list-item" key={p.id} style={{ opacity: 0.6 }}>
+              <div className="li-top">
+                <div>
+                  <div className="li-name">{p.memo || "(メモなし)"}</div>
+                  <div className="li-date">{fmtDay(p.date)} 利用 → {p.envName} に振り分け済み</div>
+                </div>
+                <div className="mono" style={{ fontSize: 15 }}>{yen(p.amount)}</div>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- 返却待ちタブ ----------
+function PendingTab({ data, onReturn }) {
+  const [confirmId, setConfirmId] = useState(null);
+  const open = data.pending.filter((p) => !p.done);
+  const done = data.pending.filter((p) => p.done).slice(0, 10);
+
+  return (
+    <div>
+      {open.length === 0 && (
+        <div className="empty">返却待ちのおつりはありません。すっきり!</div>
+      )}
+      {open.map((p) => (
+        <div className="list-item" key={p.id}>
+          <div className="li-top">
+            <div>
+              <div className="li-name">{p.envName}</div>
+              <div className="li-date">{fmtDate(p.date)} に発生</div>
+            </div>
+            <div className="mono amt-ret" style={{ fontSize: 18, fontWeight: 600 }}>{yen(p.amount)}</div>
+          </div>
+          <div style={{ marginTop: 10, display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+            {confirmId === p.id ? (
+              <>
+                <span style={{ fontSize: 12, color: C.inkSoft, alignSelf: "center" }}>
+                  袋から{yen(p.amount)}を取り出しましたか?
+                </span>
+                <button className="btn shu" onClick={() => { onReturn(p.id); setConfirmId(null); }}>はい、返却した</button>
+                <button className="btn ghost" onClick={() => setConfirmId(null)}>戻る</button>
+              </>
+            ) : (
+              <button className="btn shu" onClick={() => setConfirmId(p.id)}>返却する</button>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {done.length > 0 && (
+        <>
+          <div className="section-label">返却済み(直近)</div>
+          {done.map((p) => (
+            <div className="list-item" key={p.id} style={{ opacity: 0.6 }}>
+              <div className="li-top">
+                <div>
+                  <div className="li-name">{p.envName}</div>
+                  <div className="li-date">{p.doneDate ? fmtDate(p.doneDate) : ""} 返却済み</div>
+                </div>
+                <div className="mono" style={{ fontSize: 15 }}>{yen(p.amount)}</div>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- 履歴タブ ----------
+function HistoryTab({ data }) {
+  const label = { deposit: "入金", withdraw: "出金", return: "おつり返却" };
+  const cls = { deposit: "amt-in", withdraw: "amt-out", return: "amt-ret" };
+  const sign = { deposit: "+", withdraw: "−", return: "−" };
+
+  return (
+    <div>
+      {data.transactions.length === 0 && (
+        <div className="empty">まだ記録がありません。</div>
+      )}
+      {data.transactions.map((t) => (
+        <div className="list-item" key={t.id}>
+          <div className="li-top">
+            <div>
+              <div className="li-name">
+                {t.envName} <span style={{ fontWeight: 400, fontSize: 12, color: C.inkSoft }}>/ {label[t.type]}</span>
+              </div>
+              <div className="li-date">{fmtDate(t.date)}</div>
+            </div>
+            <div className={`mono ${cls[t.type]}`} style={{ fontSize: 17, fontWeight: 600 }}>
+              {sign[t.type]}{yen(t.amount)}
+            </div>
+          </div>
+          {t.type === "deposit" && t.alloc !== t.amount && (
+            <div className="li-memo">割り当て {yen(t.alloc)}(おつり {yen(t.amount - t.alloc)} を返却待ちに登録)</div>
+          )}
+          {t.type === "deposit" && t.settledCount > 0 && (
+            <div className="li-memo">クレカ利用 {t.settledCount}件分を振り分け</div>
+          )}
+          {t.memo && <div className="li-memo">{t.memo}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------- シート: 袋を追加 ----------
+function AddEnvSheet({ onClose, onSave }) {
+  const [name, setName] = useState("");
+  return (
+    <Sheet onClose={onClose}>
+      <h2>袋を追加</h2>
+      <div className="field">
+        <label>袋の名前</label>
+        <input type="text" value={name} placeholder="例: 食費 / ゆうちょ用 / 日用品"
+          onChange={(e) => setName(e.target.value)} autoFocus />
+      </div>
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn primary" disabled={!name.trim()} onClick={() => onSave(name.trim())}>追加する</button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- シート: クレカ利用を記録 ----------
+function PurchaseSheet({ envelopes, onClose, onSave }) {
+  const [amount, setAmount] = useState("");
+  const [memo, setMemo] = useState("");
+  const [envId, setEnvId] = useState(envelopes.length === 1 ? envelopes[0].id : "");
+  const [dateStr, setDateStr] = useState(todayStr());
+  const v = parseInt(amount, 10) || 0;
+
+  if (envelopes.length === 0) {
+    return (
+      <Sheet onClose={onClose}>
+        <h2>クレカ利用を記録</h2>
+        <div className="env-of">先に「袋」タブで袋を作ってください。振り分け先の袋が必要です。</div>
+        <div className="sheet-actions">
+          <button className="btn primary" onClick={onClose}>わかった</button>
+        </div>
+      </Sheet>
+    );
+  }
+
+  return (
+    <Sheet onClose={onClose}>
+      <h2>クレカ利用を記録</h2>
+      <div className="env-of">カードを切ったら記録。あとで現金化して袋に入れるまで「振り分け待ち」として残ります。</div>
+
+      <div className="field">
+        <label>いつ</label>
+        <input type="date" value={dateStr} onChange={(e) => setDateStr(e.target.value)} />
+      </div>
+
+      <div className="field">
+        <label>何を買った</label>
+        <input type="text" value={memo} placeholder="例: スーパーで食材"
+          onChange={(e) => setMemo(e.target.value)} />
+      </div>
+
+      <div className="field">
+        <label>いくら</label>
+        <input type="number" inputMode="numeric" value={amount} placeholder="3200"
+          onChange={(e) => setAmount(e.target.value)} />
+      </div>
+
+      <div className="field">
+        <label>どの袋によける</label>
+        <div className="quick">
+          {envelopes.map((env) => (
+            <button key={env.id} className={`chip ${envId === env.id ? "on" : ""}`}
+              onClick={() => setEnvId(env.id)}>{env.name}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn primary" disabled={v <= 0 || !envId}
+          onClick={() => onSave(envId, v, memo.trim(), dateStr)}>
+          記録する
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- シート: 入金 ----------
+function DepositSheet({ env, purchases, onClose, onSave }) {
+  const [alloc, setAlloc] = useState("");
+  const [actual, setActual] = useState("");
+  const [memo, setMemo] = useState("");
+  const [mode, setMode] = useState("just"); // just | sen | man | free
+  const [selected, setSelected] = useState([]);
+
+  const a = parseInt(alloc, 10) || 0;
+
+  const applyMode = (m, base) => {
+    const v = base ?? (parseInt(alloc, 10) || 0);
+    setMode(m);
+    if (m === "just") setActual(String(v));
+    if (m === "sen") setActual(String(Math.ceil(v / 1000) * 1000));
+    if (m === "man") setActual(String(Math.ceil(v / 10000) * 10000));
+  };
+
+  const onAllocChange = (val) => {
+    setAlloc(val);
+    const v = parseInt(val, 10) || 0;
+    if (mode !== "free") applyMode(mode, v);
+  };
+
+  const togglePurchase = (p) => {
+    const next = selected.includes(p.id)
+      ? selected.filter((x) => x !== p.id)
+      : [...selected, p.id];
+    setSelected(next);
+    const sum = purchases.filter((x) => next.includes(x.id)).reduce((s, x) => s + x.amount, 0);
+    setAlloc(String(sum || ""));
+    if (mode !== "free") applyMode(mode, sum);
+  };
+
+  const act = parseInt(actual, 10) || 0;
+  const diff = act - a;
+  const valid = a > 0 && act >= a;
+
+  return (
+    <Sheet onClose={onClose}>
+      <h2>入金</h2>
+      <div className="env-of">「{env?.name}」の袋に入れます</div>
+
+      {purchases.length > 0 && (
+        <div className="field">
+          <label>振り分けるクレカ利用を選ぶ(選ぶと金額が自動で入ります)</label>
+          {purchases.map((p) => (
+            <button key={p.id} className={`pick ${selected.includes(p.id) ? "on" : ""}`}
+              onClick={() => togglePurchase(p)}>
+              <span className="box">{selected.includes(p.id) ? "✓" : ""}</span>
+              <span style={{ flex: 1, fontSize: 13 }}>
+                <b>{p.memo || "(メモなし)"}</b>
+                <span style={{ color: C.inkSoft, marginLeft: 6, fontSize: 11 }}>{fmtDay(p.date)}</span>
+              </span>
+              <span className="mono" style={{ fontWeight: 600 }}>{yen(p.amount)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="field">
+        <label>何を買った分?(任意)</label>
+        <input type="text" value={memo} placeholder="例: スーパーの食材とドラッグストア"
+          onChange={(e) => setMemo(e.target.value)} />
+      </div>
+
+      <div className="field">
+        <label>割り当てたい金額</label>
+        <input type="number" inputMode="numeric" value={alloc} placeholder="8000"
+          onChange={(e) => onAllocChange(e.target.value)} />
+      </div>
+
+      <div className="field">
+        <label>実際に入れる金額(手持ちの札)</label>
+        <div className="quick">
+          <button className={`chip ${mode === "just" ? "on" : ""}`} onClick={() => applyMode("just")}>ぴったり</button>
+          <button className={`chip ${mode === "sen" ? "on" : ""}`} onClick={() => applyMode("sen")}>千円札で</button>
+          <button className={`chip ${mode === "man" ? "on" : ""}`} onClick={() => applyMode("man")}>一万円札で</button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <input type="number" inputMode="numeric" value={actual} placeholder="10000"
+            onChange={(e) => { setMode("free"); setActual(e.target.value); }} />
+        </div>
+      </div>
+
+      {valid && diff > 0 && (
+        <div className="note-shu">
+          おつり {yen(diff)} が発生します。<br />
+          「返却待ち」に登録して、忘れないようにお知らせします。
+        </div>
+      )}
+      {valid && diff === 0 && (
+        <div className="note-ok">ぴったり入金。おつりはありません。</div>
+      )}
+      {a > 0 && act > 0 && act < a && (
+        <div className="note-shu">入れる金額が割り当てより少なくなっています。</div>
+      )}
+
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn primary" disabled={!valid} onClick={() => onSave(a, act, selected, memo.trim())}>
+          {yen(act)} を入金する
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- シート: 出金 ----------
+function WithdrawSheet({ env, onClose, onSave }) {
+  const [amount, setAmount] = useState("");
+  const [memo, setMemo] = useState("");
+  const v = parseInt(amount, 10) || 0;
+
+  return (
+    <Sheet onClose={onClose}>
+      <h2>出金</h2>
+      <div className="env-of">「{env?.name}」の袋から取り出します(残高 {yen(env?.balance)})</div>
+      <div className="field">
+        <label>金額</label>
+        <input type="number" inputMode="numeric" value={amount} placeholder="1500"
+          onChange={(e) => setAmount(e.target.value)} autoFocus />
+      </div>
+      <div className="field">
+        <label>メモ(任意)</label>
+        <input type="text" value={memo} placeholder="例: スーパーで買い物"
+          onChange={(e) => setMemo(e.target.value)} />
+      </div>
+      {v > (env?.balance || 0) && (
+        <div className="note-shu">残高を超えています。記録は残せますが、残高がマイナスになります。</div>
+      )}
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn primary" disabled={v <= 0} onClick={() => onSave(v, memo.trim())}>
+          {yen(v)} を出金する
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- シート: 削除確認 ----------
+function DeleteSheet({ env, onClose, onDelete }) {
+  return (
+    <Sheet onClose={onClose}>
+      <h2>袋を削除</h2>
+      <div className="env-of">
+        「{env?.name}」(残高 {yen(env?.balance)})を削除します。履歴は残りますが、未返却のおつりと振り分け待ちのクレカ記録は消えます。
+      </div>
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn shu" onClick={onDelete}>削除する</button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- 共通シート ----------
+function Sheet({ children, onClose }) {
+  return (
+    <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="sheet" role="dialog" aria-modal="true">{children}</div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<FukuroWake />);
+</script>
+
+<script>
+  // 手動でBabel変換する。自動処理(data-presets)だとreactプリセットの
+  // 既定であるautomatic JSXランタイムが使われ、UMD版Reactでは
+  // "react/jsx-runtime"を解決できずimport文が残ってしまうため、
+  // classicランタイムを明示して変換する。
+  (function () {
+    const src = document.getElementById("app-source").textContent;
+    const { code } = Babel.transform(src, {
+      presets: [["react", { runtime: "classic" }]],
+    });
+    const script = document.createElement("script");
+    script.textContent = code;
+    document.body.appendChild(script);
+  })();
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js");
+    });
+  }
+</script>
+</body>
+</html>
