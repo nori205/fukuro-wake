@@ -234,6 +234,25 @@ function FukuroWake() {
       return d;
     });
 
+  const recordExternalPurchase = (toEnvId, cost, memo, dateStr, payer) =>
+    update((d) => {
+      const to = d.envelopes.find((e) => e.id === toEnvId);
+      if (!to) return d;
+      const date = dateStr ? new Date(dateStr + "T12:00:00").toISOString() : new Date().toISOString();
+      const pid = uid();
+      const payerName = payer && payer.trim() ? payer.trim() : "(外部)";
+      d.purchases.unshift({
+        id: pid, fromEnvId: null, toEnvId, fromName: payerName, toName: to.name,
+        cost, moved: 0, memo, date, external: true,
+      });
+      d.adjustments.unshift({
+        id: uid(), purchaseId: pid,
+        fromEnvId: null, toEnvId, fromName: payerName, toName: to.name,
+        amount: cost, memo, date, done: false,
+      });
+      return d;
+    });
+
   const removePurchase = (pid) =>
     update((d) => {
       const p = d.purchases.find((x) => x.id === pid);
@@ -479,7 +498,7 @@ function FukuroWake() {
           <button className="fw-alert shu" onClick={() => setTab("adjust")}>
             <div className="fw-stamp shu">要<br />調整</div>
             <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.shu }}>移し過ぎ・移し足りない分があります</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.shu }}>移し過ぎ・移し足りない分や、未回収の立替があります</div>
               <div className="mono" style={{ fontSize: 20, fontWeight: 600, color: C.shu }}>
                 {yen(adjustTotal)}
                 <span style={{ fontSize: 12, marginLeft: 6 }}>({openAdjust.length}件)</span>
@@ -559,6 +578,10 @@ function FukuroWake() {
           onClose={() => setModal(null)}
           onSave={(fromEnvId, toEnvId, cost, moved, memo, dateStr) => {
             recordPurchase(fromEnvId, toEnvId, cost, moved, memo, dateStr);
+            setModal(null);
+          }}
+          onSaveExternal={(toEnvId, cost, memo, dateStr, payer) => {
+            recordExternalPurchase(toEnvId, cost, memo, dateStr, payer);
             setModal(null);
           }}
         />
@@ -744,7 +767,10 @@ function PurchasesTab({ data, onAdd, onRemove, onEditMemo }) {
               </div>
               <div className="mono amt-card" style={{ fontSize: 17, fontWeight: 600 }}>{yen(p.cost)}</div>
             </div>
-            {diff !== 0 && (
+            {p.external && (
+              <div className="li-memo">{p.fromName}からの回収待ち・入金されるまで封筒残高には反映されません</div>
+            )}
+            {!p.external && diff !== 0 && (
               <div className="li-memo">
                 実際に移した額 {yen(p.moved)}({diff > 0 ? `${yen(diff)} 多め` : `${yen(-diff)} 少なめ`}・要調整に登録済み)
               </div>
@@ -887,10 +913,12 @@ function AddEnvSheet({ group, onClose, onSave }) {
 }
 
 // ---------- シート: 購入を記録(予算封筒 → カード封筒) ----------
-function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
+function PurchaseSheet({ envelopes, presetFromId, onClose, onSave, onSaveExternal }) {
   const budgetEnvs = envelopes.filter((e) => e.group === "budget");
   const cardEnvs = envelopes.filter((e) => e.group === "card");
 
+  const [external, setExternal] = useState(false);
+  const [payer, setPayer] = useState("");
   const [fromEnvId, setFromEnvId] = useState(presetFromId || (budgetEnvs.length === 1 ? budgetEnvs[0].id : ""));
   const [toEnvId, setToEnvId] = useState(cardEnvs.length === 1 ? cardEnvs[0].id : "");
   const [dateStr, setDateStr] = useState(todayStr());
@@ -899,7 +927,7 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
   const [moved, setMoved] = useState("");
   const [mode, setMode] = useState("just");
 
-  if (budgetEnvs.length === 0 || cardEnvs.length === 0) {
+  if ((!external && budgetEnvs.length === 0) || cardEnvs.length === 0) {
     return (
       <Sheet onClose={onClose}>
         <h2>購入を記録</h2>
@@ -932,11 +960,17 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
   const diff = m - c;
   const fromName = budgetEnvs.find((e) => e.id === fromEnvId)?.name || "予算封筒";
   const toName = cardEnvs.find((e) => e.id === toEnvId)?.name || "カード封筒";
-  const valid = c > 0 && m > 0 && fromEnvId && toEnvId && memo.trim();
+  const valid = external
+    ? c > 0 && toEnvId && memo.trim() && payer.trim()
+    : c > 0 && m > 0 && fromEnvId && toEnvId && memo.trim();
   const missing = [];
   if (!(c > 0)) missing.push("いくら(購入額)");
-  if (!(m > 0)) missing.push("実際に移す額");
-  if (!fromEnvId) missing.push("どの予算封筒から");
+  if (external) {
+    if (!payer.trim()) missing.push("誰が払ってくれる");
+  } else {
+    if (!(m > 0)) missing.push("実際に移す額");
+    if (!fromEnvId) missing.push("どの予算封筒から");
+  }
   if (!toEnvId) missing.push("どのカード封筒へ");
   if (!memo.trim()) missing.push("何をどこで買った");
 
@@ -944,6 +978,12 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
     <Sheet onClose={onClose}>
       <h2>購入を記録</h2>
       <div className="env-of">クレカで買ったら、その場で記録。使った予算封筒からカード封筒へお金を移します。</div>
+
+      <div className="field">
+        <button className={`chip ${external ? "on" : ""}`} onClick={() => setExternal(!external)}>
+          {external ? "✓ " : ""}これは自分のお金を使わない(あとで人から返してもらう)
+        </button>
+      </div>
 
       <div className="field">
         <label>いつ</label>
@@ -962,15 +1002,25 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
           onChange={(e) => onCostChange(e.target.value)} onWheel={(e) => e.target.blur()} />
       </div>
 
-      <div className="field">
-        <label>どの予算封筒から</label>
-        <div className="quick">
-          {budgetEnvs.map((env) => (
-            <button key={env.id} className={`chip ${fromEnvId === env.id ? "on" : ""}`}
-              onClick={() => setFromEnvId(env.id)}>{env.name}</button>
-          ))}
+      {external && (
+        <div className="field">
+          <label>誰が払ってくれる</label>
+          <input type="text" value={payer} placeholder="例: 母"
+            onChange={(e) => setPayer(e.target.value)} />
         </div>
-      </div>
+      )}
+
+      {!external && (
+        <div className="field">
+          <label>どの予算封筒から</label>
+          <div className="quick">
+            {budgetEnvs.map((env) => (
+              <button key={env.id} className={`chip ${fromEnvId === env.id ? "on" : ""}`}
+                onClick={() => setFromEnvId(env.id)}>{env.name}</button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="field">
         <label>どのカード封筒へ</label>
@@ -982,30 +1032,38 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
         </div>
       </div>
 
-      <div className="field">
-        <label>実際に移す額(丸めてOK)</label>
-        <div className="quick">
-          <button className={`chip ${mode === "just" ? "on" : ""}`} onClick={() => applyMode("just")}>購入額ぴったり</button>
-          <button className={`chip ${mode === "sen" ? "on" : ""}`} onClick={() => applyMode("sen")}>千円単位</button>
-          <button className={`chip ${mode === "man" ? "on" : ""}`} onClick={() => applyMode("man")}>一万円単位</button>
+      {!external && (
+        <div className="field">
+          <label>実際に移す額(丸めてOK)</label>
+          <div className="quick">
+            <button className={`chip ${mode === "just" ? "on" : ""}`} onClick={() => applyMode("just")}>購入額ぴったり</button>
+            <button className={`chip ${mode === "sen" ? "on" : ""}`} onClick={() => applyMode("sen")}>千円単位</button>
+            <button className={`chip ${mode === "man" ? "on" : ""}`} onClick={() => applyMode("man")}>一万円単位</button>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <input type="number" inputMode="numeric" value={moved} placeholder="8500"
+              onChange={(e) => { setMode("free"); setMoved(e.target.value); }} onWheel={(e) => e.target.blur()} />
+          </div>
         </div>
-        <div style={{ marginTop: 8 }}>
-          <input type="number" inputMode="numeric" value={moved} placeholder="8500"
-            onChange={(e) => { setMode("free"); setMoved(e.target.value); }} onWheel={(e) => e.target.blur()} />
-        </div>
-      </div>
+      )}
 
-      {c > 0 && m > 0 && diff > 0 && (
+      {external && c > 0 && (
+        <div className="note-shu">
+          {toName} の残高はまだ動かしません。「要調整」に {yen(c)}({payer.trim() || "誰か"}から回収待ち)として登録し、実際に受け取って解消した時に {toName} へ入金されます。
+        </div>
+      )}
+
+      {!external && c > 0 && m > 0 && diff > 0 && (
         <div className="note-shu">
           購入額より {yen(diff)} 多く移すので、あとで「{toName} → {fromName}」に {yen(diff)} 戻す調整が「要調整」に登録されます。
         </div>
       )}
-      {c > 0 && m > 0 && diff < 0 && (
+      {!external && c > 0 && m > 0 && diff < 0 && (
         <div className="note-shu">
           購入額より {yen(-diff)} 少なく移すので、あとで「{fromName} → {toName}」に追加で {yen(-diff)} 移す調整が「要調整」に登録されます。
         </div>
       )}
-      {c > 0 && m > 0 && diff === 0 && (
+      {!external && c > 0 && m > 0 && diff === 0 && (
         <div className="note-ok">ぴったりです。調整は発生しません。</div>
       )}
 
@@ -1018,7 +1076,10 @@ function PurchaseSheet({ envelopes, presetFromId, onClose, onSave }) {
       <div className="sheet-actions">
         <button className="btn ghost" onClick={onClose}>やめる</button>
         <button className="btn primary" disabled={!valid}
-          onClick={() => onSave(fromEnvId, toEnvId, c, m, memo.trim(), dateStr)}>
+          onClick={() => {
+            if (external) onSaveExternal(toEnvId, c, memo.trim(), dateStr, payer.trim());
+            else onSave(fromEnvId, toEnvId, c, m, memo.trim(), dateStr);
+          }}>
           記録する
         </button>
       </div>
