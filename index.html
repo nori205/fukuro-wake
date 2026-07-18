@@ -213,7 +213,7 @@ function FukuroWake() {
         cost, moved, memo, date,
       });
       d.transactions.unshift({
-        id: uid(), type: "purchase", fromEnvId, toEnvId, fromName: from.name, toName: to.name,
+        id: uid(), type: "purchase", purchaseId: pid, fromEnvId, toEnvId, fromName: from.name, toName: to.name,
         amount: moved, cost, memo, date,
       });
       const diff = moved - cost;
@@ -286,6 +286,17 @@ function FukuroWake() {
       }
       t.amount = amount;
       t.memo = memo;
+      return d;
+    });
+
+  const updatePurchaseMemo = (purchaseId, memo) =>
+    update((d) => {
+      const p = d.purchases.find((x) => x.id === purchaseId);
+      if (p) p.memo = memo;
+      const t = d.transactions.find((x) => x.type === "purchase" && x.purchaseId === purchaseId);
+      if (t) t.memo = memo;
+      const adj = d.adjustments.find((x) => x.purchaseId === purchaseId);
+      if (adj) adj.memo = memo;
       return d;
     });
 
@@ -505,12 +516,20 @@ function FukuroWake() {
             data={data}
             onAdd={() => setModal({ type: "purchase" })}
             onRemove={removePurchase}
+            onEditMemo={(purchaseId) => setModal({ type: "editPurchaseMemo", purchaseId })}
           />
         )}
 
         {tab === "adjust" && <AdjustTab data={data} onResolve={resolveAdjustment} />}
         {tab === "history" && (
-          <HistoryTab data={data} onEdit={(txId) => setModal({ type: "editTx", txId })} />
+          <HistoryTab
+            data={data}
+            onEdit={(t) => setModal(
+              t.type === "purchase"
+                ? { type: "editPurchaseMemo", purchaseId: t.purchaseId }
+                : { type: "editTx", txId: t.id }
+            )}
+          />
         )}
 
         <div className="footer">
@@ -586,6 +605,19 @@ function FukuroWake() {
           onSave={(name, balance) => { editEnvelope(modal.envId, name, balance); setModal(null); }}
         />
       )}
+      {modal?.type === "editPurchaseMemo" && (() => {
+        const p = data.purchases.find((x) => x.id === modal.purchaseId);
+        if (!p) return null;
+        return (
+          <MemoSheet
+            title="メモを編集"
+            hint={`「${p.fromName} → ${p.toName}」(${yen(p.cost)})の購入記録のメモを修正します`}
+            defaultMemo={p.memo}
+            onClose={() => setModal(null)}
+            onSave={(memo) => { updatePurchaseMemo(modal.purchaseId, memo); setModal(null); }}
+          />
+        );
+      })()}
       {modal?.type === "editTx" && (() => {
         const tx = data.transactions.find((t) => t.id === modal.txId);
         if (!tx) return null;
@@ -682,7 +714,7 @@ function EnvelopeTab({ data, onAddBudget, onAddCard, onDeposit, onWithdraw, onUs
 }
 
 // ---------- 購入記録タブ ----------
-function PurchasesTab({ data, onAdd, onRemove }) {
+function PurchasesTab({ data, onAdd, onRemove, onEditMemo }) {
   const [confirmId, setConfirmId] = useState(null);
   const list = data.purchases.slice(0, 60);
 
@@ -724,7 +756,10 @@ function PurchasesTab({ data, onAdd, onRemove }) {
                   <button className="btn ghost" onClick={() => setConfirmId(null)}>戻る</button>
                 </>
               ) : (
-                <button className="btn ghost" onClick={() => setConfirmId(p.id)}>削除</button>
+                <>
+                  <button className="btn ghost" onClick={() => onEditMemo(p.id)}>メモ編集</button>
+                  <button className="btn ghost" onClick={() => setConfirmId(p.id)}>削除</button>
+                </>
               )}
             </div>
           </div>
@@ -794,7 +829,7 @@ function AdjustTab({ data, onResolve }) {
 function HistoryTab({ data, onEdit }) {
   const label = { deposit: "入金", withdraw: "出金", purchase: "購入", settle: "引き落とし確定", adjust: "調整" };
   const cls = { deposit: "amt-in", withdraw: "amt-out", purchase: "amt-card", settle: "amt-out", adjust: "amt-ret" };
-  const editable = { deposit: true, withdraw: true, settle: true };
+  const editable = { deposit: true, withdraw: true, settle: true, purchase: true };
 
   return (
     <div>
@@ -821,7 +856,7 @@ function HistoryTab({ data, onEdit }) {
           {t.memo && <div className="li-memo">{t.memo}</div>}
           {editable[t.type] && (
             <div style={{ marginTop: 8, display: "flex", justifyContent: "flex-end" }}>
-              <button className="btn ghost" onClick={() => onEdit(t.id)}>編集</button>
+              <button className="btn ghost" onClick={() => onEdit(t)}>編集</button>
             </div>
           )}
         </div>
@@ -1016,6 +1051,25 @@ function AmountSheet({ title, hint, memoPlaceholder, defaultAmount, defaultMemo,
         <button className="btn primary" disabled={v <= 0} onClick={() => onSave(v, memo.trim())}>
           {confirmLabel || `${yen(v)} で確定`}
         </button>
+      </div>
+    </Sheet>
+  );
+}
+
+// ---------- シート: メモを編集 ----------
+function MemoSheet({ title, hint, defaultMemo, onClose, onSave }) {
+  const [memo, setMemo] = useState(defaultMemo || "");
+  return (
+    <Sheet onClose={onClose}>
+      <h2>{title}</h2>
+      {hint && <div className="env-of">{hint}</div>}
+      <div className="field">
+        <label>メモ</label>
+        <input type="text" value={memo} onChange={(e) => setMemo(e.target.value)} autoFocus />
+      </div>
+      <div className="sheet-actions">
+        <button className="btn ghost" onClick={onClose}>やめる</button>
+        <button className="btn primary" disabled={!memo.trim()} onClick={() => onSave(memo.trim())}>保存する</button>
       </div>
     </Sheet>
   );
